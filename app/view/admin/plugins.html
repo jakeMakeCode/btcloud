@@ -69,9 +69,9 @@ td{overflow: hidden;text-overflow: ellipsis;white-space: nowrap;max-width:340px;
 	  </table>
 	</div>
   </div>
-<script src="//lf6-cdn-tos.bytecdntp.com/cdn/expire-1-M/layer/3.5.1/layer.js"></script>
-<script src="//lf6-cdn-tos.bytecdntp.com/cdn/expire-1-M/bootstrap-table/1.19.1/bootstrap-table.min.js"></script>
-<script src="//lf6-cdn-tos.bytecdntp.com/cdn/expire-1-M/bootstrap-table/1.19.1/extensions/page-jump-to/bootstrap-table-page-jump-to.min.js"></script>
+<script src="{$cdnpublic}layer/3.5.1/layer.js"></script>
+<script src="{$cdnpublic}bootstrap-table/1.19.1/bootstrap-table.min.js"></script>
+<script src="{$cdnpublic}bootstrap-table/1.19.1/extensions/page-jump-to/bootstrap-table-page-jump-to.min.js"></script>
 <script src="/static/js/custom.js"></script>
 <script>
 
@@ -157,8 +157,13 @@ function download_item(){
         layer.alert('成功下载'+$.downloadCount+'个插件包！', {icon:1}, function(){layer.closeAll();searchSubmit();});
         return;
     }
-    $.downloadCount++;
     var plugin = $.preDownload[0];
+    if(plugin.name == 'firewall'){
+        $.preDownload.shift();
+		download_item();
+        return;
+    }
+    $.downloadCount++;
     var ii = layer.msg('['+$.downloadCount+'/'+$.preDownloadCount+']正在下载'+plugin.name+'-'+plugin.version, {icon: 16, shade:0.1, time: 0});
     $.ajax({
 		type : 'POST',
