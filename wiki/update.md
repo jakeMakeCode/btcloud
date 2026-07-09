@@ -12,6 +12,8 @@
 
 - 批量解密模块文件：执行 php think decrypt classdir <面板class文件夹路径>
 
+  php think decrypt all <面板mod文件夹路径>
+
 - 全局搜索替换 https://api.bt.cn => http://www.example.com
 
 - 全局搜索替换 https://www.bt.cn/api/ => http://www.example.com/api/（需排除clearModel.py、scanningModel.py、ipsModel.py、domainMod.py、js文件、/v3/litessl/eab）
@@ -95,6 +97,8 @@
   def err_collection(self, get): 这一行下面加上 return public.returnMsg(True, "OK")
 
 - class/push/site_push.py 文件，'https://www.bt.cn' => 'http://www.example.com'
+
+- class/panelModel/publicModel.py 删除 data['dedicated_servicer'] = _config_obj.read_dedicated_servicer()
 
 - script/flush_plugin.py 文件，删除clear_hosts()一行
 
