@@ -65,9 +65,11 @@ Fix_Apt_Lock(){
         "/var/cache/apt/archives/lock"
     )
 
-    # 优先使用 fuser（C 二进制，速度快），仅在 fuser 不可用时回退 python fcntl
+    # 锁检测: fuser / python3-fcntl 任一可用即用, 但无论哪条路径都再用
+    # 不依赖外部工具的 /proc/*/fd 扫描(_find_lock_pids)兜底——最小化镜像可能
+    # 既无 fuser(psmisc) 也无 python3, 旧逻辑此时会恒判"无锁"导致不等待、不清锁。
     if command -v fuser >/dev/null 2>&1; then
-        _check_lock() { fuser "$1" >/dev/null 2>&1; }
+        _check_lock() { fuser "$1" >/dev/null 2>&1 || [ -n "$(_find_lock_pids "$1")" ]; }
     elif command -v python3 >/dev/null 2>&1; then
         _detect_lock_py() {
             python3 - "$1" << 'PYEOF'
@@ -83,9 +85,10 @@ except Exception:
     sys.exit(1)  # 文件不存在等，视为无锁
 PYEOF
         }
-        _check_lock() { _detect_lock_py "$1"; }
+        _check_lock() { _detect_lock_py "$1" || [ -n "$(_find_lock_pids "$1")" ]; }
     else
-        _check_lock() { return 1; }  # 无检测工具，视为无锁
+        # 无 fuser 无 python3: 仅靠 /proc fd 扫描判定(返回0=有进程持锁)
+        _check_lock() { [ -n "$(_find_lock_pids "$1")" ]; }
     fi
 
     # 3. 通过 /proc/*/fd 查找持锁进程（不依赖 fuser，不依赖进程名）
@@ -124,7 +127,7 @@ PYEOF
         esac
     }
 
-    # 5. 等待锁自然释放（最多 180 秒）
+    # 5. 等待锁自然释放（最多 90 秒）
     local wait=0
     while true; do
         local held=0
@@ -192,6 +195,225 @@ PYEOF
     return 0
 }
 
+_dpkg_lock_busy(){
+    local lf pid fd target p
+    for lf in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock; do
+        [ -e "$lf" ] || continue
+        for pid in /proc/[0-9]*; do
+            [ -d "$pid/fd" ] || continue
+            p=${pid#/proc/}
+            [ "$p" = "$$" ] && continue
+            for fd in "$pid"/fd/*; do
+                target=$(readlink "$fd" 2>/dev/null) || continue
+                [ "$target" = "$lf" ] && return 0
+            done
+        done
+    done
+    return 1
+}
+
+Apt_Ready(){
+    [ "$_APT_READY_OK" = "1" ] && return 0
+    Apt_Switch_Archive
+    local _i
+    for _i in 1 2 3; do
+        if apt-get -o Acquire::Languages=none update -y; then
+            if _dpkg_lock_busy; then
+                echo "索引已就绪, 但 dpkg 锁被占用(多为 unattended-upgrades), 等待并清理..."
+                Fix_Apt_Lock
+            fi
+            _APT_READY_OK=1
+            return 0
+        fi
+        echo "apt-get update 未成功(可能 apt 锁被占用或源异常)，等待锁并重试 ${_i}/3 ..."
+        Fix_Apt_Lock
+        sleep 2
+    done
+    return 1
+}
+
+Apt_Switch_Archive(){
+    [ -f /etc/os-release ] || return 0
+    [ -f /etc/apt/sources.list ] || return 0
+    local _ID _v
+    _ID=$(grep -E '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    _v=$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | cut -d. -f1)
+    [ "$_ID" = "debian" ] || return 0
+    [ "$_v" = "11" ] || return 0
+    grep -q 'debian-archive/debian/ bullseye' /etc/apt/sources.list 2>/dev/null && return 0
+    echo "Debian 11 (bullseye) 已结束支持(EOL)，切换到归档源 debian-archive..."
+    \cp -rpa /etc/apt/sources.list /etc/apt/sources.list.btarchive.bak 2>/dev/null
+    # 不写 deb-src, 避免拉取大体积 Sources 索引; 安装只需二进制包
+    echo "deb https://mirrors.aliyun.com/debian-archive/debian/ bullseye main contrib non-free" > /etc/apt/sources.list
+    echo "deb https://mirrors.aliyun.com/debian-archive/debian-security bullseye-security main contrib non-free" >> /etc/apt/sources.list
+}
+
+_asm_reachable(){
+    local u="$1" code
+    case "$u" in
+        http://*|https://*) ;;
+        *) u="http://$u" ;;
+    esac
+    code=$(curl -s -o /dev/null --connect-timeout 4 -m 6 -w "%{http_code}" "$u" 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+_asm_current_host(){
+    local h="" sf
+    if [ -f /etc/apt/sources.list ]; then
+        h=$(grep -E '^deb[[:space:]]' /etc/apt/sources.list | head -1 | sed -E 's|^deb[[:space:]]+https?://([^/ ]+).*|\1|')
+    fi
+    for sf in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/ubuntu.sources; do
+        [ -f "$sf" ] || continue
+        h=$(grep -E '^URIs:' "$sf" | head -1 | sed -E 's|^URIs:[[:space:]]+https?://([^/ ]+).*|\1|')
+        [ -n "$h" ] && break
+    done
+    echo "$h"
+}
+
+_asm_write_classic(){
+    local _f="$1" _m="$2"
+    if [ "${ID}" = "debian" ]; then
+        cat > "$_f" <<EOF
+deb ${_m}/debian ${_code} main contrib non-free
+deb ${_m}/debian ${_code}-updates main contrib non-free
+deb ${_m}/debian-security ${_code}-security main contrib non-free
+EOF
+    else
+        cat > "$_f" <<EOF
+deb ${_m}/ubuntu ${_code} main restricted universe multiverse
+deb ${_m}/ubuntu ${_code}-updates main restricted universe multiverse
+deb ${_m}/ubuntu ${_code}-security main restricted universe multiverse
+EOF
+    fi
+}
+
+_asm_write_deb822(){
+    local _f="$1" _m="$2"
+    if [ "${ID}" = "debian" ]; then
+        cat > "$_f" <<EOF
+Types: deb
+URIs: ${_m}/debian
+Suites: ${_code} ${_code}-updates
+Components: main contrib non-free
+
+Types: deb
+URIs: ${_m}/debian-security
+Suites: ${_code}-security
+Components: main contrib non-free
+EOF
+    else
+        cat > "$_f" <<EOF
+Types: deb
+URIs: ${_m}/ubuntu
+Suites: ${_code} ${_code}-updates ${_code}-security
+Components: main restricted universe multiverse
+EOF
+    fi
+}
+
+Apt_Switch_Mirror(){
+    command -v apt-get >/dev/null 2>&1 || return 0
+    [ "$_BT_MIRROR_OK" = "1" ] && return 0
+
+    [ -f /etc/os-release ] && . /etc/os-release
+    local _id="${ID}"
+    case "${_id}" in
+        debian|ubuntu) ;;
+        *) return 0 ;;
+    esac
+    local _maj="${VERSION_ID%%.*}"
+    if [ "${_id}" = "debian" ] && [ "${_maj}" -le 10 ]; then
+        return 0
+    fi
+
+    local _code="${VERSION_CODENAME}"
+    if [ -z "${_code}" ]; then
+        case "${_id}:${_maj}" in
+            debian:11) _code=bullseye ;;
+            debian:12) _code=bookworm ;;
+            debian:13) _code=trixie ;;
+            ubuntu:20) _code=focal ;;
+            ubuntu:22) _code=jammy ;;
+            ubuntu:24) _code=noble ;;
+        esac
+    fi
+    [ -n "${_code}" ] || return 0
+
+    local _cur
+    _cur=$(_asm_current_host)
+    if [ -n "$_cur" ] && _asm_reachable "$_cur"; then
+        _BT_MIRROR_OK=1
+        return 0
+    fi
+
+    local _deb822="" sf
+    for sf in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/ubuntu.sources; do
+        [ -f "$sf" ] && grep -q '^URIs:' "$sf" && { _deb822="$sf"; break; }
+    done
+
+    local _cands=()
+    if getent hosts mirrors.tencentyun.com >/dev/null 2>&1; then
+        _cands+=("http://mirrors.tencentyun.com")
+    fi
+    if getent hosts mirrors.cloud.aliyuncs.com >/dev/null 2>&1; then
+        _cands+=("http://mirrors.cloud.aliyuncs.com")
+    fi
+    if [ "${_id}" = "debian" ]; then
+        _cands+=("https://mirrors.aliyun.com" "https://mirrors.ustc.edu.cn" "https://mirrors.tuna.tsinghua.edu.cn" "https://repo.huaweicloud.com" "https://deb.debian.org")
+    else
+        _cands+=("https://mirrors.aliyun.com" "https://mirrors.ustc.edu.cn" "https://mirrors.tuna.tsinghua.edu.cn" "https://repo.huaweicloud.com" "http://archive.ubuntu.com")
+    fi
+
+    # 备份一次在用的源文件
+    if [ -n "$_deb822" ]; then
+        \cp -rpa "$_deb822" "${_deb822}.btmirror.bak" 2>/dev/null
+    elif [ -f /etc/apt/sources.list ]; then
+        \cp -rpa /etc/apt/sources.list /etc/apt/sources.list.btmirror.bak 2>/dev/null
+    fi
+
+    # 逐个候选写入并 update 验证
+    local _m
+    for _m in "${_cands[@]}"; do
+        _asm_reachable "$_m" || continue
+        if [ -n "$_deb822" ]; then
+            _asm_write_deb822 "$_deb822" "$_m"
+        else
+            _asm_write_classic /etc/apt/sources.list "$_m"
+        fi
+        if apt-get -o Acquire::Languages=none update -y >/dev/null 2>&1; then
+            echo "已切换到可用软件源: $_m"
+            _BT_MIRROR_OK=1
+            return 0
+        fi
+    done
+
+    # 全部失败: 恢复备份
+    echo "所有候选软件源均不可用，恢复原源配置"
+    if [ -n "$_deb822" ] && [ -f "${_deb822}.btmirror.bak" ]; then
+        \cp -rpa "${_deb822}.btmirror.bak" "$_deb822"
+    elif [ -f /etc/apt/sources.list.btmirror.bak ]; then
+        \cp -rpa /etc/apt/sources.list.btmirror.bak /etc/apt/sources.list
+    fi
+    return 1
+}
+
+
+Apt_Fix_Broken(){
+    command -v apt-get >/dev/null 2>&1 || return 0
+	# 先快速校验: apt 已处于一致状态则直接返回(正常机器零修复开销)
+    if apt-get check >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "修复 apt/dpkg 未满足依赖..."
+    dpkg --configure -a 2>/dev/null || true
+    apt-get install -f -y
+    if apt-get check >/dev/null 2>&1; then
+        echo "apt/dpkg 依赖状态已修复"; return 0
+    fi
+    echo "警告: apt 依赖仍未恢复，可能需人工执行 apt-get -f install"; return 1
+}
+
 Fix_Apt_Dependencies(){
     [ ! -f "/usr/bin/apt-get" ] && return 0
 
@@ -226,25 +448,62 @@ Fix_Apt_Dependencies(){
         fi
     fi
 
-    echo "标准修复无效，尝试移除导致死锁的非关键系统包..."
+    # 第 2 步：处理半升级导致的"精确版本错配"（如 vim 依赖 vim-common(=.34) 但源已滚动到 .36）
+    # 动态找出 未解包/半配置/半安装(iU/iF/iH) 的包
+    local broken_pkgs
+    broken_pkgs=$(dpkg -l 2>/dev/null | awk '/^i[UFH]/{print $2}' | sed 's/:[a-z0-9]*$//' | sort -u | tr '\n' ' ')
+    if [ -n "${broken_pkgs}" ]; then
+        echo "检测到半安装/未配置的包: ${broken_pkgs}"
+        echo "尝试将这些包对齐到软件源内的一致版本..."
+        # 一次性升级对齐（vim/vim-tiny/vim-common 一起升到 .36 即可解开）
+        apt-get install -y --only-upgrade ${broken_pkgs} 2>/dev/null || {
+            # 整体失败则逐个升级，跳过源内已下架的包
+            for _bp in ${broken_pkgs}; do
+                apt-get install -y --only-upgrade "${_bp}" 2>/dev/null || true
+            done
+        }
+        dpkg --configure -a 2>/dev/null || true
+        apt-get install -f -y 2>/dev/null || true
+    fi
 
-    # 第 2 步：识别并强制移除导致死锁的非关键包
-    # 这些包都是 Ubuntu 系统升级/订阅管理工具，不影响服务器基础运行和宝塔功能
-    local DEADLOCK_PACKAGES=(
-        "update-manager-core"
-        "ubuntu-advantage-tools"
-        "ubuntu-pro-client"
-        "ubuntu-release-upgrader-core"
-        "python3-update-manager"
-        "python3-distupgrade"
-        "ubuntu-release-upgrader-gtk"
-        "update-manager"
-    )
+    # 第 3 步：仍损坏则强制移除非关键损坏包（关键包白名单保护，绝不能删）
+    _is_keep_pkg() {
+        case "$1" in
+            wget|curl|tar|xz|xz-utils|unzip|zip|gcc|g++|make|openssl|ca-certificates|apt|dpkg|base-files|bash|perl|coreutils|login|passwd|mount|util-linux)
+                return 0 ;;
+            libc6*|libssl*|libgcc*|libstdc*|python3*|systemd*|init*|linux-*)
+                return 0 ;;
+            *)
+                return 1 ;;
+        esac
+    }
 
+    local still_broken
+    still_broken=$(dpkg -l 2>/dev/null | awk '/^i[UFH]/{print $2}' | sed 's/:[a-z0-9]*$//' | sort -u | tr '\n' ' ')
     local removed=0
+    if [ -n "${still_broken}" ]; then
+        echo "版本对齐仍无法修复，尝试移除阻塞安装的非关键损坏包..."
+        for pkg in ${still_broken}; do
+            if _is_keep_pkg "$pkg"; then
+                echo "  跳过系统/面板关键包(保留): $pkg"
+                continue
+            fi
+            echo "  强制移除损坏的非关键包: $pkg"
+            dpkg --remove --force-remove-reinstreq --force-depends "$pkg" 2>/dev/null || true
+            dpkg --purge --force-all "$pkg" 2>/dev/null || true
+            removed=$((removed + 1))
+        done
+    fi
+
+    # 兼容：系统升级/订阅管理工具死锁包列表
+    local DEADLOCK_PACKAGES=(
+        "update-manager-core" "ubuntu-advantage-tools" "ubuntu-pro-client"
+        "ubuntu-release-upgrader-core" "python3-update-manager"
+        "python3-distupgrade" "ubuntu-release-upgrader-gtk" "update-manager"
+    )
     for pkg in "${DEADLOCK_PACKAGES[@]}"; do
         if dpkg -l "$pkg" 2>/dev/null | grep -q "^ii\|^iU\|^iF\|^iH"; then
-            echo "  移除问题包: $pkg"
+            echo "  移除系统升级工具问题包: $pkg"
             dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
             dpkg --purge --force-all "$pkg" 2>/dev/null || true
             removed=$((removed + 1))
@@ -252,7 +511,7 @@ Fix_Apt_Dependencies(){
     done
 
     if [ $removed -gt 0 ]; then
-        echo "已移除 $removed 个导致依赖死锁的包，重新修复依赖..."
+        echo "已处理 $removed 个问题包，重新修复依赖..."
         dpkg --configure -a 2>/dev/null || true
         apt-get install -f -y 2>/dev/null || true
     fi
@@ -267,11 +526,6 @@ Fix_Apt_Dependencies(){
 }
 
 Fix_Yum_Lock(){
-    # yum/rpm 锁检测与修复，处理以下场景：
-    # 1. 上一次 yum 异常中断，残留 .sqlite-journal / __db* 锁文件
-    # 2. 存在未完成的 yum 事务（unfinished transactions remaining）
-    # 3. yum 历史数据库损坏导致 database is locked
-    # 4. 后台 yum/rpm 进程仍在运行
     [ ! -f "/usr/bin/yum" ] && return 0
     echo "检查 yum/rpm 锁状态..."
 
@@ -393,7 +647,7 @@ Centos6Check=$(cat /etc/redhat-release | grep ' 6.' | grep -iE 'centos|Red Hat')
 if [ "${Centos6Check}" ];then
 	echo "Centos6不支持安装宝塔面板，请更换Centos7/8安装宝塔面板"
 	exit 1
-fi 
+fi
 
 UbuntuCheck=$(cat /etc/issue|grep Ubuntu|awk '{print $2}'|cut -f 1 -d '.')
 if [ "${UbuntuCheck}" ] && [ "${UbuntuCheck}" -lt "16" ];then
@@ -442,7 +696,7 @@ Download_File(){
     local backup_domain=$2
     local file_path=$3
     local save_path=$4
-    
+
     local max_retry=2
 	local connect_timeout=15
     local timeout=20
@@ -450,15 +704,15 @@ Download_File(){
     local retry_count=0
     local download_success=0
     local current_url=""
-    
-	
+
+
     echo "正在下载: $(basename ${save_path})"
-    
+
     while [ ${retry_count} -lt ${max_retry} ]; do
         if [ -f "${save_path}" ]; then
             rm -f "${save_path}"
         fi
-        
+
         if [ ${retry_count} -eq 0 ]; then
             current_url="${primary_domain}${file_path}"
             #echo "使用主下载节点: ${primary_domain}"
@@ -466,7 +720,7 @@ Download_File(){
             current_url="${backup_domain}${file_path}"
             #echo "切换到备用下载节点: ${backup_domain}"
         fi
-        
+
         if command -v curl >/dev/null 2>&1; then
             curl -fL --connect-timeout ${connect_timeout} --speed-limit ${min_speed} --speed-time 10 -o "${save_path}" "${current_url}"
             if [ $? -eq 0 ] && [ -f "${save_path}" ]; then
@@ -489,14 +743,14 @@ Download_File(){
             echo "错误: 未找到curl或wget下载工具"
             return 1
         fi
-        
+
         retry_count=$((retry_count + 1))
         if [ ${retry_count} -lt ${max_retry} ]; then
             echo "下载失败，${retry_count}/${max_retry} 次重试中..."
             sleep 2
         fi
     done
-    
+
     if [ ${download_success} -eq 0 ]; then
         echo "错误: 下载失败，已重试 ${max_retry} 次"
         #echo "主节点: ${primary_domain}${file_path}"
@@ -508,7 +762,7 @@ Download_File(){
 	if [ ${retry_count} -gt 0 ] && [ ${download_success} -eq 1 ]; then
 		download_Url=${backup_domain}
 	fi
-    
+
     #echo "下载成功: $(basename ${save_path})"
     return 0
 }
@@ -516,7 +770,7 @@ Download_File(){
 Ready_Check(){
     WWW_DISK_SPACE=$(df |grep /www|awk '{print $4}')
     ROOT_DISK_SPACE=$(df |grep /$|awk '{print $4}')
- 
+
    if [ "${ROOT_DISK_SPACE}" -le 412000 ];then
 	df -h
         echo -e "系统盘剩余空间不足400M 无法继续安装宝塔面板！"
@@ -574,7 +828,7 @@ GetSysInfo(){
 	echo -e "============================================"
 	echo -e "请截图以上报错信息发帖至论坛www.bt.cn/bbs求助"
 	echo -e "============================================"
-	
+
 	if [ -f "/etc/redhat-release" ];then
 		Centos7Check=$(cat /etc/redhat-release | grep ' 7.' | grep -iE 'centos')
 		echo -e "============================================"
@@ -583,14 +837,14 @@ GetSysInfo(){
 		echo -e "============================================"
 	fi
 
-	
+
 	if [ -f "/usr/sbin/setstatus" ] || [ -f "/usr/sbin/setstatus" ];then
 		echo -e "=================================================="
 		echo -e "  检测到为麒麟系统，可能默认开启安全功能导致安装失败"
 		echo -e "  请执行以下命令关闭安全加固后，再重新安装宝塔面板看是否正常"
 		echo -e "  命令：sudo setstatus softmode -p"
 		echo -e "=================================================="
-	fi  
+	fi
 
 	#2026-3-14新增常用命令检测
 	CORE_TOOLS="wget tar xz unzip"
@@ -623,15 +877,48 @@ GetSysInfo(){
 			done
 			[ $_all_ok -eq 1 ] && NO_EXIST_TOOL=""
 		elif [ "${PM}" = "apt-get" ]; then
-			apt-get update -y
+			# 先等锁并刷新索引, 再安装核心工具
+			Apt_Ready
+			Apt_Fix_Broken
 			apt-get install -y $NO_EXIST_TOOL
-			# 安装失败时尝试修复依赖后重试
-			if ! command -v unzip >/dev/null 2>&1; then
-				echo "核心工具安装失败，尝试修复 apt 依赖后重试..."
-				Fix_Apt_Dependencies
-				apt-get install -y $NO_EXIST_TOOL
-			fi
+			# 安装失败时按缺失清单逐个复检(不再只硬编码看 unzip)
+			local _apt_miss=0
+			for _pkg in $NO_EXIST_TOOL; do
+				_cmd=$_pkg; [ "$_pkg" = "xz-utils" ] && _cmd="xz"
+				command -v "$_cmd" >/dev/null 2>&1 || _apt_miss=1
+			done
+				if [ "$_apt_miss" = "1" ]; then
+					echo "核心工具安装失败，检查软件源连通性..."
+					Apt_Switch_Mirror
+					Apt_Fix_Broken
+					apt-get install -y $NO_EXIST_TOOL
+					# 仍缺失再按依赖损坏处理
+					local _apt_miss2=0
+					for _pkg in $NO_EXIST_TOOL; do
+						_cmd=$_pkg; [ "$_pkg" = "xz-utils" ] && _cmd="xz"
+						command -v "$_cmd" >/dev/null 2>&1 || _apt_miss2=1
+					done
+					if [ "$_apt_miss2" = "1" ]; then
+						echo "仍有核心工具缺失，尝试修复 apt 依赖后重试..."
+						Fix_Apt_Dependencies
+						Apt_Ready
+						Apt_Fix_Broken
+						apt-get install -y $NO_EXIST_TOOL
+					fi
+				fi
 		fi
+	fi
+
+	# 安装后统一复检(yum/apt 共用)：按命令名确认核心工具是否就位，全部就位则清空
+	# 缺失清单，避免"工具已成功安装却仍误报缺少工具"，并防止误报污染错误上报
+	if [ -n "$NO_EXIST_TOOL" ]; then
+		local _post_ok=1
+		for _pkg in $NO_EXIST_TOOL; do
+			_cmd=$_pkg
+			[ "${PM}" = "apt-get" ] && [ "$_pkg" = "xz-utils" ] && _cmd="xz"
+			command -v "$_cmd" >/dev/null 2>&1 || _post_ok=0
+		done
+		[ "$_post_ok" = "1" ] && NO_EXIST_TOOL=""
 	fi
 
 	if [ -n "$NO_EXIST_TOOL" ]; then
@@ -663,7 +950,7 @@ GetSysInfo(){
 	# 	elif [ -f "/usr/bin/apt-get" ];then
 	# 		echo "安装依赖命令: apt-get install libssl-dev -y"
 	# 	fi
-	# 	rm -rf /www/server/panel/pyenv 
+	# 	rm -rf /www/server/panel/pyenv
 	# 	echo -e "=================================================="
 	# fi
 
@@ -754,7 +1041,7 @@ Get_Pack_Manager(){
 	if [ -f "/usr/bin/yum" ] && [ -d "/etc/yum.repos.d" ]; then
 		PM="yum"
 	elif [ -f "/usr/bin/apt-get" ] && [ -f "/usr/bin/dpkg" ]; then
-		PM="apt-get"		
+		PM="apt-get"
 	fi
 }
 Check_And_Fix_Debian_Ubuntu_Source(){
@@ -763,21 +1050,21 @@ Check_And_Fix_Debian_Ubuntu_Source(){
 	# 场景：用户系统升级后，sources.list中仍然保留了旧版本的代号，导致安装过程中无法找到正确的软件包，安装失败
     [ ! -f "/usr/bin/apt-get" ] && return 0
     [ ! -f "/etc/os-release" ] && return 0
-    
+
     . /etc/os-release
-    
+
     # 只处理Debian和Ubuntu
     if [ "${ID}" != "debian" ] && [ "${ID}" != "ubuntu" ]; then
         return 0
     fi
     echo "=================================================="
     echo "检查${ID}系统源配置..."
-    
+
     # 定义版本代号映射（按版本顺序）
     local correct_codename=""
     local version_order=""
     local version_index=0
-    
+
     if [ "${ID}" = "debian" ]; then
         case "${VERSION_ID%%.*}" in
             10) correct_codename="buster"; version_index=10 ;;
@@ -794,7 +1081,7 @@ Check_And_Fix_Debian_Ubuntu_Source(){
             ["bookworm"]=12
             ["trixie"]=13
         )
-        
+
     elif [ "${ID}" = "ubuntu" ]; then
         case "${VERSION_ID}" in
             18.04) correct_codename="bionic"; version_index=1804 ;;
@@ -812,25 +1099,25 @@ Check_And_Fix_Debian_Ubuntu_Source(){
             ["noble"]=2404
         )
     fi
-    
+
     if [ -z "${correct_codename}" ]; then
         echo "未识别的${ID}版本: ${VERSION_ID}"
         return 0
     fi
-    
+
     echo "当前系统: ${ID} ${VERSION_ID} -> 正确: ${correct_codename}"
-    
+
     # 检查sources.list
     sources_file="/etc/apt/sources.list"
     if [ ! -f "${sources_file}" ]; then
         echo "源文件 ${sources_file} 不存在，跳过检查"
         return 0
     fi
-    
+
     # 收集需要替换的旧代号
     need_fix=0
     old_codenames=""
-    
+
     if [ "${ID}" = "debian" ]; then
         for codename in "${!debian_versions[@]}"; do
             local codename_version=${debian_versions[$codename]}
@@ -847,7 +1134,7 @@ Check_And_Fix_Debian_Ubuntu_Source(){
                 fi
             fi
         done
-        
+
     elif [ "${ID}" = "ubuntu" ]; then
         for codename in "${!ubuntu_versions[@]}"; do
             local codename_version=${ubuntu_versions[$codename]}
@@ -865,44 +1152,44 @@ Check_And_Fix_Debian_Ubuntu_Source(){
             fi
         done
     fi
-    
+
     if [ ${need_fix} -eq 0 ]; then
         #echo "系统源配置正确，无需修复"
         return 0
     fi
-    
+
     # 备份并修复
     echo "=================================================="
     echo "检测到系统源配置使用了旧的版本服务器代号！"
     echo "当前系统: ${ID} ${VERSION_ID} 应使用服务器代号: ${correct_codename}"
     echo "正在自动修复旧版本服务器代号..."
     echo "=================================================="
-    
+
     # 备份原文件
     backup_file="${sources_file}.bak.$(date +%Y%m%d_%H%M%S)"
     \cp -p "${sources_file}" "${backup_file}"
     echo "已备份到: ${backup_file}"
-    
+
     # 只替换旧版本的代号
     for wrong_codename in ${old_codenames}; do
         sed -ri "/^[[:space:]]*(deb|deb-src) / s/${wrong_codename}/${correct_codename}/g" "${sources_file}"
         echo "已替换: ${wrong_codename} -> ${correct_codename}"
     done
-    
+
     echo "源配置已修复，更新软件包列表..."
     apt-get update -y 2>&1 | head -n 20
-    
+
     if [ $? -eq 0 ]; then
         echo "源更新成功！"
     else
         echo "警告: apt-get update 执行失败，可能需要手动检查"
         echo "如需回滚，备份文件在: ${backup_file}"
     fi
-    
+
     return 0
 }
 Set_Repo_Url(){
-	if [ "${PM}"="apt-get" ];then
+	if [ "${PM}" = "apt-get" ];then
 
 		if [ -f "/etc/os-release" ];then
 			. /etc/os-release
@@ -978,7 +1265,7 @@ Set_Repo_Url(){
 							if [ $? != "0" ];then
 								\cp -rpa /etc/apt/sources.list.d/ubuntu.sources.bak  /etc/apt/sources.list.d/ubuntu.sources
 								apt-get update -y
-						    fi 
+						    fi
 						fi
 						break;
 					fi
@@ -1024,7 +1311,7 @@ Auto_Swap()
 		echo "Swap total sizse: $swap";
 		return;
 	fi
-	
+
 	sed -i "/\/www\/swap/d" /etc/fstab
 	rm -f $swapFile
 }
@@ -1036,10 +1323,10 @@ Service_Add(){
 		if [ "${Centos9Check}" ];then
             wget -O /usr/lib/systemd/system/btpanel.service ${download_Url}/init/systemd/btpanel.service
 			systemctl enable btpanel
-		fi		
+		fi
 	elif [ "${PM}" == "apt-get" ]; then
 		update-rc.d bt defaults
-	fi 
+	fi
 }
 Set_Centos7_Repo(){
 # 	CN_YUM_URL=$(grep -E "aliyun|163|tencent|tsinghua" /etc/yum.repos.d/CentOS-Base.repo)
@@ -1073,7 +1360,7 @@ Set_Centos7_Repo(){
 		return
 	fi
 
-	yum install unzip -y
+	yum install unzip  -y
 	if [ "$?" != "0" ] ;then
 		TAR_CHECK=$(which tar)
 		if [ "$?" == "0" ] ;then
@@ -1228,11 +1515,11 @@ get_node_url(){
 		echo '---------------------------------------------';
 		return
 	fi
-	
+
 	echo '---------------------------------------------';
 	echo "Selected download node...";
 	nodes=(https://dg2.bt.cn https://download.bt.cn https://download-cdn1.bt.cn https://ctcc1-node.bt.cn https://cmcc1-node.bt.cn https://ctcc2-node.bt.cn https://hk1-node.bt.cn https://na1-node.bt.cn https://jp1-node.bt.cn https://cf1-node.aapanel.com https://download-cdn1.bt.cn);
-	
+
 	CURL_CHECK=$(which curl)
 	if [ "$?" == "0" ];then
 		CN_CHECK=$(curl -sS --connect-timeout 10 -m 10 https://api.bt.cn/api/isCN)
@@ -1285,7 +1572,7 @@ get_node_url(){
 				if [ $RES -ge 2390 ];then
 					break;
 				fi
-			fi	
+			fi
 		fi
 	done
 
@@ -1308,7 +1595,7 @@ Remove_Package(){
 		isPackage=$(rpm -q ${PackageNmae}|grep "not installed")
 		if [ -z "${isPackage}" ];then
 			yum remove ${PackageNmae} -y
-		fi 
+		fi
 	elif [ "${PM}" == "apt-get" ];then
 		isPackage=$(dpkg -l|grep ${PackageNmae})
 		if [ "${PackageNmae}" ];then
@@ -1323,7 +1610,7 @@ Install_OpenSSL3(){
     fi
     echo "正在安装 OpenSSL 3.x 依赖..."
     yum install -y perl-core zlib-devel
-    
+
     cd /tmp
     wget -O openssl-3.0.10.tar.gz $download_Url/src/openssl-3.0.10.tar.gz -T 30
     tar zxf openssl-3.0.10.tar.gz
@@ -1331,11 +1618,11 @@ Install_OpenSSL3(){
     ./config --prefix=/usr/local/openssl3 --openssldir=/usr/local/openssl3 shared zlib
     make -j$cpu_cpunt
     make install
-    
+
     # 配置动态库链接
     echo "/usr/local/openssl3/lib64" > /etc/ld.so.conf.d/openssl3.conf
     ldconfig
-    
+
     cd ~
     rm -rf /tmp/openssl-3.0.10 /tmp/openssl-3.0.10.tar.gz
 }
@@ -1358,11 +1645,11 @@ Install_RPM_Pack(){
 	Centos9Check=$(cat /etc/redhat-release | grep ' 9' | grep -iE 'centos|Red Hat')
 	if [ "${Centos9Check}" ];then
 		Set_Centos9_Repo
-	fi		
+	fi
 	Centos8Check=$(cat /etc/redhat-release | grep ' 8.' | grep -iE 'centos|Red Hat')
 	if [ "${Centos8Check}" ];then
 		Set_Centos8_Repo
-	fi	
+	fi
 	Centos7Check=$(cat /etc/redhat-release | grep ' 7.' | grep -iE 'centos|Red Hat')
 	if [ "${Centos7Check}" ];then
 		Set_Centos7_Repo
@@ -1383,15 +1670,15 @@ Install_RPM_Pack(){
 
 	#SYS_TYPE=$(uname -a|grep x86_64)
 	#yumBaseUrl=$(cat /etc/yum.repos.d/CentOS-Base.repo|grep baseurl=http|cut -d '=' -f 2|cut -d '$' -f 1|head -n 1)
-	#[ "${yumBaseUrl}" ] && checkYumRepo=$(curl --connect-timeout 5 --head -s -o /dev/null -w %{http_code} ${yumBaseUrl})	
+	#[ "${yumBaseUrl}" ] && checkYumRepo=$(curl --connect-timeout 5 --head -s -o /dev/null -w %{http_code} ${yumBaseUrl})
 	#if [ "${checkYumRepo}" != "200" ] && [ "${SYS_TYPE}" ];then
 	#	curl -Ss --connect-timeout 3 -m 60 http://download.bt.cn/install/yumRepo_select.sh|bash
 	#fi
-	
+
 	#尝试同步时间(从bt.cn)
 	echo 'Synchronizing system time...'
 	getBtTime=$(curl -sS --connect-timeout 3 -m 60 https://www.bt.cn/api/index/get_time)
-	if [ "${getBtTime}" ];then	
+	if [ "${getBtTime}" ];then
 		date -s "$(date -d @$getBtTime +"%Y-%m-%d %H:%M:%S")"
 	fi
 
@@ -1425,11 +1712,11 @@ Install_RPM_Pack(){
 	fi
 
 	# if [ ! -f "/usr/bin/mysql" ] && [ -f "/usr/sbin/mysql" ];then
-	# 	yum install 
+	# 	yum install
 	# fi
 
 	ALI_OS=$(cat /etc/redhat-release |grep "Alibaba Cloud Linux release 3")
-	if [ -z "${ALI_OS}" ];then 
+	if [ -z "${ALI_OS}" ];then
 		yum install epel-release -y
 	fi
 }
@@ -1444,7 +1731,9 @@ Install_Deb_Pack(){
 	if [ "${ALIYUN_CHECK}" ] && [ "${UBUNTU_22}" ];then
 		apt-get remove libicu70 -y
 	fi
-	apt-get update -y
+	# 等 apt 锁就绪并刷新索引(开机 apt-daily 持锁时在此等待, 避免整批 debPacks 撞锁漏装)
+	Apt_Ready
+	Apt_Fix_Broken
 
 	FNOS_CHECK=$(cat /etc/issue|grep fnOS)
 	if [ "${FNOS_CHECK}" ];then
@@ -1486,18 +1775,18 @@ Install_Deb_Pack(){
 			apt-get install -y $debPack
 		fi
 	done
-	
+
 	if [ ! -f "/usr/bin/mysql" ] && [ -f "/usr/sbin/mysql" ];then
 		apt-get install mysql-client -y
 	fi
-	
+
 	if [ ! -d '/etc/letsencrypt' ];then
 		mkdir -p /etc/letsencryp
 		mkdir -p /var/spool/cron
 		if [ ! -f '/var/spool/cron/crontabs/root' ];then
 			echo '' > /var/spool/cron/crontabs/root
 			chmod 600 /var/spool/cron/crontabs/root
-		fi	
+		fi
 	fi
 }
 
@@ -1519,7 +1808,7 @@ Install_Python_Lib(){
 			rm -rf /www/server/panel/python
 		fi
 	fi
-	
+
 	curl -Ss --connect-timeout 3 -m 60 $download_Url/install/pip_select.sh|bash
 	if [ "${LOCK_PIP}" ];then
 		if [ ! -d ~/.pip ];then
@@ -1533,7 +1822,7 @@ index-url = https://mirrors.tencent.com/pypi/simple
 trusted-host = mirrors.tencent.com
 EOF
 	fi
-	
+
 	pyenv_path="/www/server/panel"
 	if [ -f $pyenv_path/pyenv/bin/python ];then
 	 	is_ssl=$($python_bin -c "import ssl" 2>&1|grep cannot)
@@ -1561,7 +1850,7 @@ EOF
 	fi
 
 	is_export_openssl=0
-	
+
 	is_aarch64=$(uname -a|grep aarch64)
 	if [ "$is_aarch64" != "" ];then
 		is64bit="aarch64"
@@ -1574,7 +1863,7 @@ EOF
 	if [ -f "/www/server/panel/pymake.pl" ];then
 		os_version=""
 		rm -f /www/server/panel/pymake.pl
-	fi	
+	fi
 	echo "==============================================="
 	echo "正在下载面板完整版运行环境，请稍等..............."
 	echo "==============================================="
@@ -1597,7 +1886,7 @@ EOF
 			chmod -R 700 $pyenv_path/pyenv/bin
 			if [ ! -f $pyenv_path/pyenv/bin/python ];then
 				rm -f $pyenv_file
-				Red_Error "ERROR: Install python env fielded." "ERROR: 下载宝塔运行环境失败，请尝试重新安装！" 
+				Red_Error "ERROR: Install python env fielded." "ERROR: 下载宝塔运行环境失败，请尝试重新安装！"
 			fi
 			$pyenv_path/pyenv/bin/python3.13 -V
 			if [ $? -eq 0 ];then
@@ -1640,7 +1929,7 @@ EOF
 			chmod -R 700 $pyenv_path/pyenv/bin
 			if [ ! -f $pyenv_path/pyenv/bin/python ];then
 				rm -f $pyenv_file
-				Red_Error "ERROR: Install python env fielded." "ERROR: 下载宝塔运行环境失败，请尝试重新安装！" 
+				Red_Error "ERROR: Install python env fielded." "ERROR: 下载宝塔运行环境失败，请尝试重新安装！"
 			fi
 			$pyenv_path/pyenv/bin/python3.13 -V
 			if [ $? -eq 0 ];then
@@ -1676,7 +1965,7 @@ EOF
 	tar xvf $python_src
 	rm -f $python_src
 	cd $python_src_path
-	./configure --prefix=$pyenv_path/pyenv 
+	./configure --prefix=$pyenv_path/pyenv
 	make -j$cpu_cpunt
 	make install
     # 强制校验SSL模块可用性（3.13.14核心依赖，缺失会导致pip、HTTPS全失效）
@@ -1752,58 +2041,36 @@ Install_Bt(){
 		mv -f ${setup_path}/server/panel/data/system.db ${setup_path}/server/panel/old_data/system.db
 		mv -f ${setup_path}/server/panel/data/port.pl ${setup_path}/server/panel/old_data/port.pl
 		mv -f ${setup_path}/server/panel/data/admin_path.pl ${setup_path}/server/panel/old_data/admin_path.pl
-		
+
 		if [ -d "${setup_path}/server/panel/data/db" ];then
 			\cp -r ${setup_path}/server/panel/data/db ${setup_path}/server/panel/old_data/
 		fi
-		
+
 	fi
 
 	if [ ! -f "/usr/bin/unzip" ]; then
 		if [ "${PM}" = "yum" ]; then
 			yum install unzip -y
 		elif [ "${PM}" = "apt-get" ]; then
-			# 先修锁再操作，避免一开始就撞锁
-			Fix_Apt_Lock
-			apt-get update
-			apt-get install unzip -y 2>&1|tee /tmp/apt_install_log.log
-			UNZIP_CHECK=$(which unzip)
-			if [ "$?" != "0" ];then
-				# 失败后再次深度修锁 + 重试
-				echo "unzip 安装失败，尝试修复锁状态后重试..."
-				Fix_Apt_Lock
-				apt-get update
+			Apt_Ready
+			Apt_Fix_Broken
+			apt-get install unzip -y
+			if ! command -v unzip >/dev/null 2>&1; then
+				echo "unzip 安装失败，检查软件源连通性..."
+				Apt_Switch_Mirror
+				Apt_Fix_Broken
 				apt-get install unzip -y
 			fi
-			UNZIP_CHECK=$(which unzip)
-			if [ "$?" != "0" ];then
-				# 检测错误类型：锁问题 or 依赖问题
-				RECONFIGURE_CHECK=$(grep "dpkg --configure -a" /tmp/apt_install_log.log)
-				APT_LOCK_CHECH=$(grep "/var/lib/dpkg/lock" /tmp/apt_install_log.log)
-				UNMET_CHECK=$(grep "Unmet dependencies\|have unmet dependencies" /tmp/apt_install_log.log)
-
-				if [ "${APT_LOCK_CHECH}" ];then
-					echo "检测到 apt 锁冲突，强制清理..."
-					pkill dpkg
-					pkill apt-get
-					pkill apt
-					[ -e /var/lib/dpkg/lock-frontend ] && rm -f /var/lib/dpkg/lock-frontend
-					[ -e /var/lib/dpkg/lock ] && rm -f /var/lib/dpkg/lock
-					[ -e /var/lib/apt/lists/lock ] && rm -f /var/lib/apt/lists/lock
-					[ -e /var/cache/apt/archives/lock ] && rm -f /var/cache/apt/archives/lock
-					dpkg --configure -a
-				fi
-
-				if [ "${UNMET_CHECK}" ] || [ "${RECONFIGURE_CHECK}" ];then
-					echo "检测到依赖冲突，执行深度依赖修复..."
-					Fix_Apt_Dependencies
-				fi
-
-				sleep 3
+			if ! command -v unzip >/dev/null 2>&1; then
+				echo "unzip 安装失败，深度修复依赖并刷新索引后重试..."
+				Fix_Apt_Dependencies
+				Apt_Ready
+				Apt_Fix_Broken
 				apt-get install unzip -y
 			fi
 		fi
 	fi
+
 
 	unzip -o panel.zip -d ${setup_path}/server/ > /dev/null
 
@@ -1812,11 +2079,11 @@ Install_Bt(){
 		mv -f ${setup_path}/server/panel/old_data/system.db ${setup_path}/server/panel/data/system.db
 		mv -f ${setup_path}/server/panel/old_data/port.pl ${setup_path}/server/panel/data/port.pl
 		mv -f ${setup_path}/server/panel/old_data/admin_path.pl ${setup_path}/server/panel/data/admin_path.pl
-		
+
 		if [ -d "${setup_path}/server/panel/old_data/db" ];then
 			\cp -r ${setup_path}/server/panel/old_data/db ${setup_path}/server/panel/data/
 		fi
-		
+
 		if [ -d "/${setup_path}/server/panel/old_data" ];then
 			rm -rf ${setup_path}/server/panel/old_data
 		fi
@@ -1839,10 +2106,10 @@ Install_Bt(){
 			Red_Error "ERROR: Failed to download, please try install again!" "ERROR: 下载宝塔失败，请尝试重新安装！"
 		fi
 	fi
-    
+
     SYS_LOG_CHECK=$(grep ^weekly /etc/logrotate.conf)
     if [ "${SYS_LOG_CHECK}" ];then
-        sed -i 's/rotate [0-9]*/rotate 8/g' /etc/logrotate.conf 
+        sed -i 's/rotate [0-9]*/rotate 8/g' /etc/logrotate.conf
     fi
 
 	rm -f panel.zip
@@ -1963,10 +2230,10 @@ Set_Bt_Panel(){
 	if [ ! -f "/www/server/panel/data/port.pl" ];then
 		echo "8888" > /www/server/panel/data/port.pl
 	fi
-	/etc/init.d/bt start 	
+	/etc/init.d/bt start
 	sleep 5
 	isStart=$(ps aux |grep 'BT-Panel'|grep -v grep|awk '{print $2}')
-	
+
 	if [ -f "/www/server/panel/data/ssl.pl" ];then
 		LOCAL_CURL=$(curl -k https://127.0.0.1:${panelPort}/login 2>&1 |grep -i html)
 	else
@@ -2009,7 +2276,7 @@ Set_Firewall(){
 		if [ -f "/usr/sbin/ufw" ];then
 			if [ "${PANEL_PORT}" ];then
 				ufw allow ${PANEL_PORT}/tcp
-			fi 
+			fi
 			ufw allow 20/tcp
 			ufw allow 21/tcp
 			ufw allow 22/tcp
@@ -2117,10 +2384,10 @@ Get_Ip_Address(){
 			fi
 		fi
 	fi
-	
+
 	CN_CHECK=$(curl -sS --connect-timeout 10 -m 10 http://www.example.com/api/isCN)
 	if [ "${CN_CHECK}" == "True" ];then
-        	echo "True" > /www/server/panel/data/domestic_ip.pl
+        echo "True" > /www/server/panel/data/domestic_ip.pl
 	else
 		echo "True" > /www/server/panel/data/foreign_ip.pl
 	fi
@@ -2193,7 +2460,7 @@ Check_Ip_Cert_Async(){
 
 	echo "正在检查受信宝塔面板ip证书开启状态..."
     wait $IP_SSL_PID
-    
+
     if [ -f "/tmp/ip_ssl_exit_code.pl" ]; then
         rc=$(cat /tmp/ip_ssl_exit_code.pl)
         rm -f /tmp/ip_ssl_exit_code.pl
@@ -2227,7 +2494,7 @@ Install_Main(){
 	if [ "${MEM_TOTAL}" -le "1" ];then
 		Auto_Swap
 	fi
-	
+
 	if [ "${PM}" = "yum" ]; then
 		Install_RPM_Pack
 	elif [ "${PM}" = "apt-get" ]; then
@@ -2330,7 +2597,7 @@ fi
 
 ARCH_LINUX=$(cat /etc/os-release |grep "Arch Linux")
 if [ "${ARCH_LINUX}" ] && [ -f "/usr/bin/pacman" ];then
-	pacman -Sy 
+	pacman -Sy
 	pacman -S curl wget unzip firewalld openssl pkg-config make gcc cmake libxml2 libxslt libvpx gd libsodium oniguruma sqlite libzip autoconf inetutils sudo --noconfirm
 fi
 
@@ -2341,10 +2608,10 @@ if [ "${PANEL_SSL}" == "True" ];then
 	HTTP_S="https"
 else
 	HTTP_S="http"
-fi 
+fi
 
 echo "安装基础网站流量统计程序..."
-wget -O site_new_total.sh ${download_Url}/site_total/install.sh &> /dev/null 
+wget -O site_new_total.sh ${download_Url}/site_total/install.sh &> /dev/null
 bash site_new_total.sh &> /dev/null
 rm -f site_new_total.sh
 echo "安装基础网站流量统计程序完成"
